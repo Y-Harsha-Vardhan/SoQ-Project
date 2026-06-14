@@ -8,11 +8,27 @@ import math
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+# Per-leg transaction fee charged on |notional|. 0.15% matches a typical
+# retail crypto taker fee.
 transaction_fee = 0.0015
 
+# sign(x) -> -1, 0, +1 used to derive trade direction from quantity / signal.
 sign = lambda x: int(x > 0) - int(x < 0)
 
+
+# ----------------------------------------------------------------------
+# Signal protocol (five states) consumed by BackTester.get_trades
+# ----------------------------------------------------------------------
+#   0  HOLD                  do nothing
+#   1  if flat: OPEN LONG    if short open: CLOSE
+#  -1  if flat: OPEN SHORT   if long  open: CLOSE
+#   2  REVERSE short -> long (close short, open long in same step)
+#  -2  REVERSE long  -> short
+# ----------------------------------------------------------------------
+
+
 class TradeType(Enum):
+    """Direction of a closed trade."""
     LONG = 1
     SHORT = -1
 
@@ -20,6 +36,11 @@ class TradeType(Enum):
         return "LONG" if self == TradeType.LONG else "SHORT"
 
 class TradePair:
+    """Record of a single round-trip trade (open + close).
+
+    `qty` is signed USD notional: positive = long, negative = short.
+    PnL deducts a per-leg transaction fee proportional to |qty|.
+    """
     def __init__(self, symbol, qty, init_price, final_price, init_timestamp, final_timestamp):
         self.symbol = symbol
         self.qty = qty  # In USD (can be +ve or -ve)
@@ -54,6 +75,11 @@ class TradePair:
         return (peak_price - lowest_price) / peak_price * 100
     
 class Position:
+    """Mutable container for the currently open position (at most one).
+
+    `qty == 0` means flat. `is_valid` enforces that the next signal is
+    consistent with the current direction (e.g. cannot open a second long).
+    """
     def __init__(self, symbol, qty, price, timestamp):
         self.symbol = symbol
         self.qty = qty
@@ -82,6 +108,23 @@ class Position:
     
 
 class BackTester:
+    """Event-driven backtester for a single-asset signal series.
+
+    Args:
+        symbol: ticker label for reporting.
+        signal_data_path: CSV with OHLCV + a `signals` column using the
+            five-state signal protocol documented at the top of this file.
+        master_file_path: OHLCV used for intrabar TP/SL scanning. Defaults
+            to the signal CSV.
+        compound_flag: position-sizing mode.
+            1 -> COMPOUNDING: realized PnL is added back into the stake,
+                 so subsequent positions are sized on grown equity.
+            0 -> FIXED-STAKE: every trade is sized on the same initial
+                 capital regardless of prior PnL.
+
+    Execution model: signal at bar t is filled at the OPEN of bar t+1
+    (lookahead-bias guard). See `preprocess_csv` and `get_trades`.
+    """
     def __init__(self, symbol, signal_data_path, master_file_path = None, compound_flag = 0):
 
         self.compound_flag = compound_flag
@@ -104,9 +147,30 @@ class BackTester:
         self.sl = 0
 
     def preprocess_csv(self, file_path):
+        """Load OHLCV CSV and pre-compute next-bar fill price / timestamp.
+
+        Adds two columns that implement the lookahead-bias guard:
+          - `next_open`      : open price of the FOLLOWING candle.
+          - `next_open_time` : timestamp of the FOLLOWING candle.
+
+        A signal generated on bar t is executed at `next_open` (bar t+1),
+        never at bar t's close. The final row has NaN next_open and is
+        skipped by `get_trades`.
+
+        `nextdatetime` (+1 minute) is kept as the upper bound for the
+        intrabar TP/SL scan in `check_tp_sl`.
+        """
         data = pd.read_csv(file_path, header=0)
         data['datetime'] = pd.to_datetime(data['datetime'])
+        data.sort_values('datetime', inplace=True)
+
+        # Intrabar TP/SL scan window upper bound.
         data["nextdatetime"] = data["datetime"] + pd.Timedelta(minutes=1)
+
+        # Lookahead-bias guard: fills land on the next candle's open.
+        data["next_open"] = data["open"].shift(-1)
+        data["next_open_time"] = data["datetime"].shift(-1)
+
         data.set_index("datetime", inplace=True)
         return data
 
@@ -143,9 +207,29 @@ class BackTester:
         return trade
 
     def get_trades(self, trade_amt):
+        """Iterate the signal series and simulate trades.
 
+        Execution: signal on bar t fills at OPEN of bar t+1 (lookahead
+        guard). TP/SL trigger intrabar at the TP/SL price itself.
+
+        Sizing: if `compound_flag` is truthy, realized PnL is added back
+        into `trade_amt` so subsequent stakes grow with equity. Otherwise
+        every trade is sized at the original `trade_amt` (fixed stake).
+
+        Raises ValueError on a signal that is inconsistent with current
+        position state, or outside the five-state protocol.
+        """
         for index, row in self.data.iterrows():
             signal = row["signals"]
+
+            # Lookahead-bias guard: fills are at the next bar's open.
+            # The final bar has no next candle, so skip it.
+            fill_price = row["next_open"]
+            fill_time = row["next_open_time"]
+            if pd.isna(fill_price):
+                continue
+
+            # Window-end timestamp used only for intrabar TP/SL scanning.
             closing_time = row["nextdatetime"]
 
             if not self.position.is_valid(signal):
@@ -165,19 +249,24 @@ class BackTester:
                 self.tp = self.sl = 0
 
             if signal == 0:
+                # HOLD.
                 continue
             elif signal == 1 or signal == -1:
                 if self.position.qty == 0:
-                    self.position.open(row["close"], sign(signal)*trade_amt, closing_time)
+                    # Open a new position at the next candle's open.
+                    self.position.open(fill_price, sign(signal) * trade_amt, fill_time)
                 else:
-                    trade = self.position.close(row["close"], closing_time)
+                    # Opposite-direction signal -> close the open position.
+                    trade = self.position.close(fill_price, fill_time)
                     self.trades.append(trade)
                     trade_amt = (trade_amt + trade.pnl()) if self.compound_flag else trade_amt
             elif signal == 2 or signal == -2:
-                trade = self.position.close(row["close"], closing_time)
+                # Reversal: close existing leg and immediately open the
+                # opposite side, both at the next candle's open.
+                trade = self.position.close(fill_price, fill_time)
                 self.trades.append(trade)
                 trade_amt = (trade_amt + trade.pnl()) if self.compound_flag else trade_amt
-                self.position.open(row["close"], sign(signal)*trade_amt, closing_time)
+                self.position.open(fill_price, sign(signal) * trade_amt, fill_time)
             else:
                 raise ValueError(f"Invalid signal {signal} at {index}")
 
